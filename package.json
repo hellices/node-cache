@@ -1,0 +1,31 @@
+{
+  "name": "abtest-cache-benchmark",
+  "version": "1.0.0",
+  "description": "In-Memory AB Test Cache Architecture Benchmark",
+  "main": "src/app.js",
+  "scripts": {
+    "start": "node src/app.js",
+    "start:gc-stress": "node --max-old-space-size=256 --expose-gc --trace-gc src/app.js",
+    "start:gc-trace": "node --expose-gc --trace-gc src/app.js",
+    "dev": "nodemon src/app.js",
+    "seed": "node scripts/seed-database.js",
+    "benchmark": "node scripts/benchmark.js",
+    "benchmark:gc": "node --expose-gc scripts/benchmark-gc.js",
+    "benchmark:gc-large": "cross-env BENCHMARK_ITERATIONS=10 CONCURRENCY=300 node --expose-gc scripts/benchmark-gc.js",
+    "gc-test": "node --max-old-space-size=128 --expose-gc scripts/gc-stress-test.js",
+    "gc-test:large": "ITERATIONS=200 CONCURRENCY=100 node --max-old-space-size=128 --expose-gc scripts/gc-stress-test.js",
+    "test:load": "node scripts/load-test.js",
+    "test:load-heavy": "LOAD_TEST_DURATION=60 LOAD_TEST_CONNECTIONS=200 node scripts/load-test.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "lru-cache": "^10.1.0",
+    "mysql2": "^3.6.5"
+  },
+  "devDependencies": {
+    "autocannon": "^7.14.0",
+    "cross-env": "^10.1.0",
+    "nodemon": "^3.0.2"
+  }
+}
