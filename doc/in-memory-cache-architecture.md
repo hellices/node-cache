@@ -7,11 +7,11 @@
 - **트래픽**: 일일 2M~4M 요청
 - **에러 현황**: 피크 시 500k~1M 에러 발생
 
-<img src="./error_rate.png" width="50%" />
+<img src="./error_rate.png" width="80%" />
 
 ### APM 프로파일링 결과
 
-<img src="./root_cause.png" width="50%" />
+<img src="./root_cause.png" width="80%" />
 
 ### 병목 분석
 
