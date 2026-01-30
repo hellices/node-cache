@@ -148,9 +148,8 @@ app.get('/api/v1/abtest/cache/:service', async (req, res) => {
     
     const { service } = req.params;
     
-    // 캐시에서 조회 (캐시 미스 시 자동 로드)
-    const meeGroupId = await abTestCache.getMeeGroupId(service);
-    const activeTests = await abTestCache.getActiveTests(service);
+    // 캐시에서 조회 (단일 캐시 조회로 효율화)
+    const data = await abTestCache.getData(service);
     
     const endTime = process.hrtime.bigint();
     const durationMs = Number(endTime - startTime) / 1_000_000;
@@ -162,10 +161,7 @@ app.get('/api/v1/abtest/cache/:service', async (req, res) => {
     res.json({
       source: 'cache',
       durationMs: durationMs.toFixed(3),
-      data: {
-        meeGroupId,
-        tests: activeTests
-      }
+      data: data || { meeGroupId: null, tests: [] }
     });
   } catch (error) {
     console.error('Cache API Error:', error);
@@ -315,9 +311,9 @@ app.post('/api/metrics/gc', (req, res) => {
 // ============================================
 async function startServer() {
   try {
-    // DB 연결 테스트 (SQLite)
+    // DB 연결 테스트 (MySQL)
     await db.testConnection();
-    console.log('SQLite connected');
+    console.log('MySQL connected');
     
     // 캐시 초기화
     await abTestCache.initialize();

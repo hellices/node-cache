@@ -40,13 +40,14 @@ class ABTestRepository {
     const placeholders = testIds.map(() => '?').join(',');
     return db.query(`
       SELECT 
-        vrnt_id,
+        ab_test_vrt_id,
         ab_test_id,
-        vrnt_key,
-        vrnt_ratio,
-        vrnt_payload
-      FROM tb_ab_test_vrnt
-      WHERE ab_test_id IN (${placeholders})
+        vrt_key,
+        vrt_vl,
+        vrt_rng_strt,
+        vrt_rng_end
+      FROM ab_test_vrts
+      WHERE ab_test_id IN (${placeholders}) AND use_yn = 'Y'
     `, testIds);
   }
 }

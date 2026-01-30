@@ -18,7 +18,7 @@
 | 총 요청 수 | 2,000회 (20 iterations × 100 concurrency) |
 | 서비스 수 | 20개 (랜덤 선택) |
 | 테스트당 variants | 5개 |
-| 서버 힙 크기 | 256MB |
+| 서버 Old Space 제한 | 256MB (`--max-old-space-size=256`) |
 
 ### 비교 대상
 

@@ -7,20 +7,11 @@
 - **트래픽**: 일일 2M~4M 요청
 - **에러 현황**: 피크 시 500k~1M 에러 발생
 
+<img src="./error_rate.png" width="50%" />
+
 ### APM 프로파일링 결과
 
-```
-GET /abtest/get-test-list  총 98.6ms (SLA 30ms 대비 3.3배 초과)
-├── ureca-v2-api-abtest router ────────────────────────── 98.6ms
-│   ├── handle ────────────────────────────────────────── 98.6ms
-│   │   ├── asyncUtilWrap ─────────────────────────────── 98.6ms
-│   │   │   ├── SQL: select mee_group_id from ab_test... ─ 4.67ms
-│   │   │   └── SQL: select at.ab_test_id, at.trgt_... ── 93.5ms
-│   │   │
-│   │   └── [Major GC 발생] ──────────────────────────── 84ms (STW)
-│   │       reason: schedule_idle
-│   │       type: major
-```
+<img src="./root_cause.png" width="50%" />
 
 ### 병목 분석
 
@@ -41,7 +32,49 @@ GET /abtest/get-test-list  총 98.6ms (SLA 30ms 대비 3.3배 초과)
 
 ---
 
-## 1. 현재 구조 (As-Is)
+## 1. 대응 방안: 1차 Pod 증가 vs 2차 In-Memory 캐시
+
+### 1차 대응 (단기): Pod 수 증가
+
+### 2차 대응 (중기): In-Memory 캐시 도입
+
+| 장점 | 단점 |
+|------|------|
+| GC 빈도 감소 | 구현 복잡도 높음 |
+| 트래픽 증가에도 안정적 | 개발 리소스 필요 |
+| DB 부하 제거 | 캐시 일관성 관리 필요 |
+
+
+---
+
+### 2차 대응 전 GC 원인 상세 확인
+
+```bash
+# GC 로그 활성화하여 실행
+node --trace-gc app.js
+
+# 출력 확인
+[12345:0x...] 84 ms: Mark-sweep 150.5 (200.0) -> 100.2 (180.0) MB, 
+  84.3 / 0.0 ms (average mu = 0.850, current mu = 0.750) 
+  allocation failure  # ← 객체 생성 과다 확정 → 캐시 도입 필요
+  # 또는
+  idle                # ← 우연히 겹친 것 → Pod 증가로 충분할 수 있음
+```
+
+| GC 원인 | 의미 | 권장 대응 |
+|---------|------|----------|
+| `allocation failure` | 객체 생성 과다 | 2차 캐시 도입 필수 |
+| `idle` | 유휴 시간 스케줄링 | 1차 Pod 증가로 충분 |
+
+---
+
+### 참고 자료
+
+[캐시 전후 비교](./GC-BENCHMARK-REPORT.md)
+
+---
+
+## 2. 현재 구조 (As-Is)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -83,7 +116,9 @@ GC 압력:
 
 ---
 
-## 2. 제안 구조 (To-Be)
+## 3. 제안 구조 (To-Be)
+
+<img src="./arch.png"/>
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -99,11 +134,10 @@ GC 압력:
                                                      ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                        In-Memory Cache (lru-cache)                          │
-│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐              │
-│  │ meeGroupCache   │  │   testCache     │  │  variantCache   │              │
-│  │ Map<service,    │  │ Map<service,    │  │ Map<testId,     │              │
-│  │     groupId>    │  │     [tests]>    │  │     [variants]> │              │
-│  └─────────────────┘  └─────────────────┘  └─────────────────┘              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │                    serviceCache (단일 통합 캐시)                     │    │
+│  │  Map<service, { meeGroupId, tests: [{ ...test, variants: [...] }] }>│    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
 │                                                                              │
 │  객체는 메모리에 한 번만 생성되어 재사용됨 (GC 압력 없음)                       │
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -130,7 +164,7 @@ GC 압력:
 
 ---
 
-## 3. 캐싱 전략 비교
+## 4. 캐싱 전략 비교
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -152,71 +186,7 @@ GC 압력:
 
 ---
 
-## 3.5 대안 비교: Pod 증가 vs In-Memory 캐시
-
-### 옵션 비교
-
-| 방안 | 구현 복잡도 | 리스크 | 효과 | 비용 |
-|------|------------|--------|------|------|
-| **Pod 증가** | 매우 낮음 | 낮음 | GC 빈도 ↓ (근본 해결 X) | 인프라 비용 ↑ |
-| **In-Memory 캐시** | 높음 | 중간 | GC 거의 제거 | 개발 리소스 |
-
-### Pod 증가로 완화되는 이유
-
-```
-Pod 1개: 1000 RPS → 요청당 10객체 → 10,000 객체/초 → Major GC 자주
-Pod 2개:  500 RPS → 요청당 10객체 →  5,000 객체/초 → Major GC 덜 자주
-Pod 4개:  250 RPS → 요청당 10객체 →  2,500 객체/초 → Major GC 더 드묾
-```
-
-### Pod 증가의 한계
-
-```
-⚠️ Pod를 늘려도 GC 발생 시 여전히 84ms STW
-   → 확률적 완화일 뿐, 근본 해결 아님
-   → 트래픽 더 증가하면 다시 문제 발생
-```
-
-### 권장 접근 순서
-
-```
-1단계: Pod 증가 시도 (저비용, 저위험)
-   │
-   ├── SLA 만족? → 완료 (캐시 구현 불필요)
-   │
-   └── SLA 불만족? → 2단계로
-   
-2단계: GC 원인 상세 확인
-   │
-   │  node --trace-gc app.js
-   │  
-   │  [출력 확인]
-   │  - "allocation failure" → 객체 생성 과다 확정
-   │  - "idle" → 우연히 겹친 것일 수 있음
-   │
-   └── allocation failure 확인 시 → 3단계로
-
-3단계: In-Memory 캐시 도입
-   → 객체 생성 자체를 제거하여 근본 해결
-```
-
-### 검증 명령어
-
-```bash
-# GC 로그 활성화하여 실행
-node --trace-gc app.js
-
-# 출력 예시
-[12345:0x...] 84 ms: Mark-sweep 150.5 (200.0) -> 100.2 (180.0) MB, 
-  84.3 / 0.0 ms (average mu = 0.850, current mu = 0.750) 
-  allocation failure  # ← 객체 생성 과다가 원인
-  # 또는
-  idle                # ← 유휴 시간에 스케줄된 GC
-```
-
----
-
-## 4. 구현 방식: lru-cache + Redis Pub/Sub
+## 5. 구현 방식: lru-cache + Redis Pub/Sub
 
 ### 4.1 왜 lru-cache인가?
 
@@ -296,10 +266,10 @@ class ABTestCache {
   // 이 로직이 fetchMethod 한 곳에만 존재
   // ========================================
   async loadFromDB(service) {
-    const testRows = await abRepository.getABTestsByService(service);
+    const testRows = await abTestRepository.getABTestsByService(service);
     const testIds = testRows.map(t => t.ab_test_id);
-    const variantRows = await abRepository.getVariantsByTestIds(testIds);
-    const meeGroup = await abRepository.getMeeGroupId(service);
+    const variantRows = await abTestRepository.getVariantsByTestIds(testIds);
+    const meeGroup = await abTestRepository.getMeeGroupId(service);
     
     // 변환 + 조합
     const tests = testRows.map(test => ({
@@ -336,7 +306,7 @@ class ABTestCache {
     }
     
     // 프리로드
-    const services = await abRepository.getAllServices();
+    const services = await abTestRepository.getAllServices();
     for (const service of services) {
       await this.cache.fetch(service);
     }
@@ -391,7 +361,7 @@ module.exports = new ABTestCache();
 
 **app.js에서 초기화:**
 ```javascript
-const abTestCache = require('./services/abtest/ABTestCache');
+const abTestCache = require('./services/ABTestCache');
 
 app.listen(PORT, async () => {
   await abTestCache.initialize();
@@ -421,7 +391,7 @@ const invalidateCache = async (service) => {
 
 ---
 
-## 5. 캐시 데이터 구조
+## 6. 캐시 데이터 구조
 
 ```javascript
 // cache.fetch('GalaxyStore') 반환값
@@ -447,7 +417,7 @@ const invalidateCache = async (service) => {
 
 ---
 
-## 6. GC 영향 비교
+## 7. GC 영향 비교
 
 ### Before (현재)
 
@@ -471,7 +441,7 @@ const invalidateCache = async (service) => {
 
 ---
 
-## 7. Redis Pub/Sub 메시지
+## 8. Redis Pub/Sub 메시지
 
 ### 채널
 ```
@@ -489,7 +459,7 @@ abtest:invalidate
 
 ---
 
-## 8. Monorepo Pod 선택적 활성화
+## 9. Monorepo Pod 선택적 활성화
 
 ```yaml
 # abtest-deployment.yaml
@@ -507,50 +477,3 @@ env:
 - Redis 연결 안 함
 - 메모리 사용 0
 - 기존 DB 직접 조회 방식 유지
-
----
-
-## 9. 구현 체크리스트
-
-### 9.1 사전 검증 (권장)
-- [ ] Pod 수 증가 후 SLA 모니터링
-- [ ] `node --trace-gc`로 GC 원인 확인
-- [ ] allocation failure 확인 시 캐시 구현 진행
-
-### 9.2 캐시 구현
-- [ ] `npm install lru-cache`
-- [ ] `ABTestCache.js` 생성
-- [ ] `app.js`에서 `initialize()` 호출
-- [ ] 서비스에서 캐시 사용하도록 변경
-- [ ] Admin에서 캐시 무효화 호출 추가
-- [ ] 환경변수 설정
-
-### 9.3 안정성 보완
-- [ ] Redis 연결 실패 시 fallback 로직
-- [ ] 프리로드 실패해도 서버 시작 허용
-- [ ] readinessProbe에 캐시 상태 반영
-- [ ] stale 데이터 허용 시간 정의 (예: 5분)
-
----
-
-## 10. 핵심 정리
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    lru-cache 구현의 장점                         │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  1. fetchMethod에 로드 로직 집중                                 │
-│     → 로드 코드가 한 곳에만 존재                                 │
-│     → 유지보수 용이                                              │
-│                                                                  │
-│  2. Redis 이벤트 → eviction만                                   │
-│     → cache.delete() 한 줄                                       │
-│     → 복잡한 reload 로직 불필요                                  │
-│                                                                  │
-│  3. 다음 요청 시 자동 로드                                       │
-│     → fetchMethod가 알아서 처리                                  │
-│     → 개발자가 로드 타이밍 신경 쓸 필요 없음                      │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-```

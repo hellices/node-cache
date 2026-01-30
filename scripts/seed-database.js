@@ -48,7 +48,7 @@ async function seedDatabase() {
     // 기존 데이터 삭제
     console.log('Clearing existing data...');
     await connection.query('SET FOREIGN_KEY_CHECKS = 0');
-    await connection.query('TRUNCATE TABLE tb_ab_test_vrnt');
+    await connection.query('TRUNCATE TABLE ab_test_vrts');
     await connection.query('TRUNCATE TABLE tb_ab_test');
     await connection.query('TRUNCATE TABLE tb_mee_group');
     await connection.query('SET FOREIGN_KEY_CHECKS = 1');
@@ -128,64 +128,18 @@ async function seedDatabase() {
         const testId = result.insertId;
         totalTests++;
         
-        // Variants 생성
+        // Variants 생성 (원본 스키마: range 기반 버킷팅)
         const variantKeys = ['A', 'B', 'C', 'D', 'E'].slice(0, VARIANTS_PER_TEST);
-        const baseRatio = Math.floor(100 / VARIANTS_PER_TEST);
+        const rangeSize = 100 / VARIANTS_PER_TEST;
         
         for (let j = 0; j < VARIANTS_PER_TEST; j++) {
-          const ratio = j === VARIANTS_PER_TEST - 1 
-            ? 100 - (baseRatio * (VARIANTS_PER_TEST - 1)) 
-            : baseRatio;
-          
-          // 대용량 payload 생성
-          const payload = {
-            color: ['red', 'blue', 'green', 'yellow', 'purple'][j],
-            buttonText: `Option ${variantKeys[j]}`,
-            imageUrl: `https://cdn.example.com/images/${service.toLowerCase()}/variant_${variantKeys[j].toLowerCase()}.png`,
-            bannerImages: Array.from({ length: 10 }, (_, idx) => ({
-              size: `${idx + 1}x`,
-              url: `https://cdn.example.com/banners/${service.toLowerCase()}/v${j}/${idx}.png`,
-              alt: `Banner ${idx} for ${service} variant ${variantKeys[j]}`
-            })),
-            translations: Object.fromEntries(
-              LANGUAGES.map(lang => [lang, {
-                title: `${lang.toUpperCase()} Title for ${service} Test`,
-                description: `This is the ${lang} description for variant ${variantKeys[j]}. `.repeat(5),
-                cta: `Click here (${lang})`,
-                disclaimer: `Terms and conditions apply. ${lang} version. `.repeat(3)
-              }])
-            ),
-            metadata: {
-              priority: j + 1,
-              features: Array.from({ length: 20 }, (_, idx) => `feature_${j}_${idx}`),
-              config: {
-                enabled: true,
-                timeout: 3000 + (j * 1000),
-                retries: j + 1,
-                fallback: { enabled: true, variant: 'default' },
-                tracking: {
-                  events: Array.from({ length: 10 }, (_, idx) => `event_${idx}`),
-                  pixels: Array.from({ length: 5 }, (_, idx) => `https://tracking.example.com/pixel/${idx}`)
-                }
-              },
-              analytics: {
-                dimensions: Object.fromEntries(
-                  Array.from({ length: 15 }, (_, idx) => [`dim_${idx}`, `value_${idx}`])
-                ),
-                metrics: Array.from({ length: 10 }, (_, idx) => ({ name: `metric_${idx}`, value: Math.random() * 100 }))
-              }
-            },
-            styles: {
-              desktop: { width: '100%', height: '400px', backgroundColor: '#fff', padding: '20px' },
-              tablet: { width: '100%', height: '300px', backgroundColor: '#f5f5f5', padding: '15px' },
-              mobile: { width: '100%', height: '200px', backgroundColor: '#fafafa', padding: '10px' },
-              customCSS: `.variant-${variantKeys[j]} { color: ${['red', 'blue', 'green', 'yellow', 'purple'][j]}; }`.repeat(10)
-            }
-          };
+          const rangeStart = j * rangeSize;
+          const rangeEnd = (j + 1) * rangeSize;
+          const variantValue = `variant_${variantKeys[j]}_value_${service.toLowerCase()}`;
           
           await connection.execute(
-            'INSERT INTO tb_ab_test_vrnt (ab_test_id, vrnt_key, vrnt_ratio, vrnt_payload) VALUES (?, ?, ?, ?)',
-            [testId, variantKeys[j], ratio, JSON.stringify(payload)]
+            'INSERT INTO ab_test_vrts (ab_test_id, vrt_key, vrt_vl, vrt_rng_strt, vrt_rng_end, use_yn) VALUES (?, ?, ?, ?, ?, ?)',
+            [testId, variantKeys[j], variantValue, rangeStart, rangeEnd, 'Y']
           );
           totalVariants++;
         }
@@ -207,7 +161,7 @@ async function seedDatabase() {
         (SELECT COUNT(*) FROM tb_mee_group) as mee_groups,
         (SELECT COUNT(*) FROM tb_ab_test) as tests,
         (SELECT COUNT(*) FROM tb_ab_test WHERE ab_test_status = 'ACTIVE') as active_tests,
-        (SELECT COUNT(*) FROM tb_ab_test_vrnt) as variants
+        (SELECT COUNT(*) FROM ab_test_vrts) as variants
     `);
     console.log('\n=== Database Stats ===');
     console.log(stats[0]);

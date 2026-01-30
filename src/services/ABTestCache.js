@@ -1,5 +1,6 @@
 const { LRUCache } = require('lru-cache');
 const abTestRepository = require('../repository/ABTestRepository');
+const bucketingService = require('./BucketingService');
 
 class ABTestCache {
   constructor() {
@@ -43,10 +44,11 @@ class ABTestCache {
       variants: variantRows
         .filter(v => v.ab_test_id === test.ab_test_id)
         .map(v => ({
-          id: v.vrnt_id,
-          key: v.vrnt_key,
-          ratio: v.vrnt_ratio,
-          payload: JSON.parse(v.vrnt_payload || '{}')
+          id: v.ab_test_vrt_id,
+          key: v.vrt_key,
+          value: v.vrt_vl,
+          rangeStart: v.vrt_rng_strt,
+          rangeEnd: v.vrt_rng_end
         }))
     }));
     
@@ -94,30 +96,58 @@ class ABTestCache {
   }
 
   // ========================================
-  // 조회 API
+  // 조회 API (내부용 - 캐시 히트 시 true 반환)
   // ========================================
-  async getMeeGroupId(service) {
-    if (process.env.ABTEST_CACHE_ENABLED !== 'true') {
-      const result = await abTestRepository.getMeeGroupId(service);
-      return result[0]?.mee_group_id;
+  async _fetchWithStats(service) {
+    // 캐시 히트 여부를 먼저 확인
+    const isHit = this.cache.has(service);
+    const data = await this.cache.fetch(service);
+    
+    if (data) {
+      if (isHit) {
+        this.stats.hits++;
+      }
+      // misses는 loadFromDB에서 이미 증가됨
     }
     
-    const data = await this.cache.fetch(service);
-    if (data) this.stats.hits++;
-    return data?.meeGroupId;
+    return data;
   }
   
-  async getActiveTests(service) {
+  // ========================================
+  // 전체 데이터 조회 (효율적 - 단일 캐시 조회)
+  // ========================================
+  async getData(service) {
     if (process.env.ABTEST_CACHE_ENABLED !== 'true') {
-      // 캐시 비활성화 시 직접 조회
-      const tests = await abTestRepository.getABTestsByService(service);
-      const testIds = tests.map(t => t.ab_test_id);
-      const variants = testIds.length > 0 
-        ? await abTestRepository.getVariantsByTestIds(testIds)
-        : [];
-      
-      const now = new Date();
-      return tests
+      return this._loadDirectFromDB(service);
+    }
+    
+    const data = await this._fetchWithStats(service);
+    if (!data) return null;
+    
+    const now = new Date();
+    return {
+      meeGroupId: data.meeGroupId,
+      tests: data.tests.filter(test => 
+        test.status === 'ACTIVE' &&
+        new Date(test.startDate) <= now &&
+        new Date(test.endDate) >= now
+      )
+    };
+  }
+  
+  // 캐시 비활성화 시 직접 DB 조회
+  async _loadDirectFromDB(service) {
+    const tests = await abTestRepository.getABTestsByService(service);
+    const testIds = tests.map(t => t.ab_test_id);
+    const variants = testIds.length > 0 
+      ? await abTestRepository.getVariantsByTestIds(testIds)
+      : [];
+    const meeGroup = await abTestRepository.getMeeGroupId(service);
+    
+    const now = new Date();
+    return {
+      meeGroupId: meeGroup[0]?.mee_group_id,
+      tests: tests
         .filter(t => t.ab_test_status === 'ACTIVE' && 
                     new Date(t.strt_dtm) <= now && 
                     new Date(t.end_dtm) >= now)
@@ -132,18 +162,37 @@ class ABTestCache {
           variants: variants
             .filter(v => v.ab_test_id === test.ab_test_id)
             .map(v => ({
-              id: v.vrnt_id,
-              key: v.vrnt_key,
-              ratio: v.vrnt_ratio,
-              payload: JSON.parse(v.vrnt_payload || '{}')
+              id: v.ab_test_vrt_id,
+              key: v.vrt_key,
+              value: v.vrt_vl,
+              rangeStart: v.vrt_rng_strt,
+              rangeEnd: v.vrt_rng_end
             }))
-        }));
+        }))
+    };
+  }
+
+  // ========================================
+  // 개별 조회 API (기존 호환성)
+  // ========================================
+  async getMeeGroupId(service) {
+    if (process.env.ABTEST_CACHE_ENABLED !== 'true') {
+      const result = await abTestRepository.getMeeGroupId(service);
+      return result[0]?.mee_group_id;
     }
     
-    const data = await this.cache.fetch(service);
-    if (!data) return [];
+    const data = await this._fetchWithStats(service);
+    return data?.meeGroupId;
+  }
+  
+  async getActiveTests(service) {
+    if (process.env.ABTEST_CACHE_ENABLED !== 'true') {
+      const result = await this._loadDirectFromDB(service);
+      return result?.tests || [];
+    }
     
-    this.stats.hits++;
+    const data = await this._fetchWithStats(service);
+    if (!data) return [];
     
     const now = new Date();
     return data.tests.filter(test => 
@@ -162,6 +211,46 @@ class ABTestCache {
     for (const service of services) {
       await this.cache.fetch(service);
     }
+  }
+  
+  // ========================================
+  // 버킷팅: 사용자별 variant 결정
+  // 캐시/DB 경로 모두 동일한 버킷팅 로직 수행
+  // ========================================
+  async getVariantForUser(service, request, testID) {
+    if (process.env.ABTEST_CACHE_ENABLED !== 'true') {
+      return this._getVariantFromDB(service, request, testID);
+    }
+    
+    const data = await this._fetchWithStats(service);
+    if (!data) return null;
+    
+    const now = new Date();
+    const test = data.tests.find(t => 
+      t.id === testID &&
+      t.status === 'ACTIVE' &&
+      new Date(t.startDate) <= now &&
+      new Date(t.endDate) >= now
+    );
+    
+    if (!test || !test.variants || test.variants.length === 0) {
+      return null;
+    }
+    
+    return bucketingService.processBucketing(testID, test.variants, request);
+  }
+  
+  // DB 직접 조회로 버킷팅
+  async _getVariantFromDB(service, request, testID) {
+    const data = await this._loadDirectFromDB(service);
+    if (!data) return null;
+    
+    const test = data.tests.find(t => t.id === testID);
+    if (!test || !test.variants || test.variants.length === 0) {
+      return null;
+    }
+    
+    return bucketingService.processBucketing(testID, test.variants, request);
   }
   
   // ========================================
